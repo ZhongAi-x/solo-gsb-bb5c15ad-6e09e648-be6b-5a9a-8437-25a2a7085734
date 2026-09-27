@@ -50,6 +50,27 @@ CREATE TABLE IF NOT EXISTS quarantined_events (
 -- 按 consumer 时间线查询隔离记录; 同一 consumer 不会重复隔离同一 seq(游标已越过, 由消费流程保证)
 CREATE INDEX IF NOT EXISTS idx_quarantine_consumer
     ON quarantined_events (consumer_id, id);
+
+CREATE TABLE IF NOT EXISTS exports (
+    export_id   TEXT PRIMARY KEY,                  -- 快照 ID
+    anchor_seq  INTEGER NOT NULL,                  -- 导出时刻的链锚点序号
+    anchor_hash TEXT NOT NULL,                     -- 导出时刻的链锚点哈希
+    tail_seq    INTEGER NOT NULL,                  -- 导出时刻末尾事件 seq(空快照等于 anchor_seq)
+    total       INTEGER NOT NULL,                  -- 副本事件总数
+    created_at  TEXT NOT NULL                      -- 导出时间(UTC ISO8601)
+);
+
+CREATE TABLE IF NOT EXISTS export_events (
+    export_id   TEXT NOT NULL,                     -- 所属快照
+    seq         INTEGER NOT NULL,                  -- 原事件首次接收顺序号(events.id)
+    event_id    TEXT NOT NULL,                     -- 以下为原事件完整内容的独立副本
+    occurred_at TEXT NOT NULL,
+    payload     TEXT NOT NULL,                     -- 原始 JSON 的独立副本
+    received_at TEXT NOT NULL,
+    prev_hash   TEXT,                              -- 链字段一并复制, 压缩原表后仍可核对
+    hash        TEXT,
+    PRIMARY KEY (export_id, seq)
+) WITHOUT ROWID;
 """
 
 

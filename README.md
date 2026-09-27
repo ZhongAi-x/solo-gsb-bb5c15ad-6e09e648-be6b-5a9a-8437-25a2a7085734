@@ -8,7 +8,7 @@
 docker compose up --build
 ```
 
-一条命令完成构建、数据库初始化与启动;服务监听 **8000** 端口,接口入口为 **http://localhost:8000**(交互式文档在 http://localhost:8000/docs,健康检查 http://localhost:8000/health)。SQLite 数据持久化在 named volume `webhook-data`,数据库表(含隔离记录表)在启动时自动创建/升级,无需手工初始化。
+一条命令完成构建、数据库初始化与启动;服务监听 **8000** 端口,接口入口为 **http://localhost:8000**(交互式文档在 http://localhost:8000/docs,健康检查 http://localhost:8000/health)。SQLite 数据持久化在 named volume `webhook-data`,数据库表(含隔离记录、快照导出表)在启动时自动创建/升级,无需手工初始化。
 
 不用 compose 也可以:
 
@@ -327,6 +327,68 @@ curl -s -X POST http://localhost:8000/retention/compact \
 curl -s http://localhost:8000/integrity
 ```
 
+### 11. 持久化快照导出
+
+需要把某一时刻的全部事件固化下来(审计、对外交付)时,可创建持久化快照:在**同一个数据库事务**内复制当前全部未压缩事件及链锚点。导出与事件接收、压缩归档共用 `BEGIN IMMEDIATE` 写锁**串行**执行,副本与元数据必然来自同一时刻,不会出现"副本是新的、锚点是旧的"。
+
+```bash
+curl -X POST http://localhost:8000/exports
+```
+
+```json
+{
+  "export_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+  "anchor_seq": 0,
+  "anchor_hash": "",
+  "tail_seq": 5,
+  "total": 5,
+  "created_at": "2026-09-27T10:00:00.000000+00:00"
+}
+```
+
+- `anchor_seq` / `anchor_hash`:导出时刻的链锚点序号与哈希(从未压缩过时为 `0` / `""`);
+- `tail_seq`:导出时刻末尾事件的 `seq`(**空快照时 `tail_seq` 等于 `anchor_seq`**);
+- `total`:副本事件总数。
+
+按原 `seq` 升序分页读取快照中的**完整事件**(含 `prev_hash`、`hash`):
+
+```bash
+curl 'http://localhost:8000/exports/a1b2c3d4e5f60718293a4b5c6d7e8f90/events?after_seq=0&limit=100'
+```
+
+```json
+{
+  "export_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+  "anchor_seq": 0,
+  "tail_seq": 5,
+  "after_seq": 0,
+  "limit": 100,
+  "next_after_seq": null,
+  "events": [
+    {"seq": 1, "event_id": "evt-1", "occurred_at": "...", "payload": {"a": 1},
+     "received_at": "...", "prev_hash": "", "hash": "2b2f3ae9…(64 位十六进制)"}
+  ]
+}
+```
+
+- **参数**:`after_seq` 只返回 `seq` 严格大于它的事件,**默认取快照锚点序号**;`limit` 取值 **1~1000**(默认 100)。
+- **翻页**:响应中的 `next_after_seq` 是下一页的游标(本页最后一条的 `seq`),把它作为下次请求的 `after_seq` 即可;**末页 `next_after_seq` 为 `null`**。
+- **范围校验**:`after_seq` 必须落在该快照的 `[anchor_seq, tail_seq]` 内(锚点之前属于已压缩、从未进入本快照的区间,末尾之后则尚未产生),否则返回 **422**(响应附 `anchor_seq`/`tail_seq`)。
+- **只读副本**:分页查询只读快照自己的副本表,创建快照之后的**新写入、原事件被压缩归档(`/retention/compact` 物理删除)乃至服务重启**都不会改变结果;副本同样带有 `prev_hash`/`hash`,可脱离原表核对哈希链。
+- **空快照**:创建时没有未压缩事件则 `tail_seq == anchor_seq` 且 `total == 0`,无论怎么翻页始终返回空页(`next_after_seq` 恒为 `null`)。
+
+删除快照(元数据与副本在同一事务内**原子删除**):
+
+```bash
+curl -X DELETE http://localhost:8000/exports/a1b2c3d4e5f60718293a4b5c6d7e8f90
+```
+
+```json
+{"deleted": true, "export_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90", "total": 5}
+```
+
+未知快照或**已删除**快照再访问(读取或删除)统一返回 **404**。
+
 ## 哈希链规范
 
 每条记录写入时在同一事务内计算并存储两个字段:
@@ -355,6 +417,7 @@ curl -s http://localhost:8000/integrity
 - **游标回退**:`POST /consumers/{consumer_id}/rewind` 在单个 `BEGIN IMMEDIATE` 事务内完成"校验 consumer/租约/回退区间 `[anchor_seq, cursor_seq]` → 清除已过期租约 → 回退游标",与 `pull`/`ack`/`ack-prefix`/`compact` 串行,并发下只有单一结果。未过期租约、低于链锚点、向前推进、未知 consumer 均 409 且状态不变;回退后游标不低于链锚点,不会产生指向已压缩事件的租约。
 - **毒丸隔离**:`POST /consumers/{consumer_id}/quarantine` 在单个 `BEGIN IMMEDIATE` 事务内完成"核对令牌(与 `ack` 同套:无租约/过期/旧令牌 409)→ 核对租约起点与游标相邻(考虑链锚点)→ 复制首条事件完整内容、原哈希与非空原因到独立 `quarantined_events` 表 → 游标仅越过这一条并清除整批租约"。下次 `pull` 重新租用剩余事件并换发新 token,旧令牌立即作废;失败原因空白返回 422。`GET /consumers/{consumer_id}/quarantine` 分页查看隔离记录;副本独立于原事件存储,原事件被压缩归档(物理删除)后仍可查看。隔离会把游标推进过该事件,因此被隔离事件视为"已处理",可正常纳入安全归档,内容由隔离副本留存。
 - **安全归档压缩**:`POST /retention/compact` 在单个 `BEGIN IMMEDIATE` 事务内完成"读锚点 → 算安全边界(所有 consumer 的最小 `cursor_seq`,无 consumer 时为当前最大 seq)→ 校验 `cutoff_seq` → 删连续前缀 → 写链锚点"。越界 409 并返回 `safe_through_seq`;`dry_run` 只算不写;已覆盖区间幂等返回 `noop`。
+- **持久化快照导出**:`POST /exports` 在单个 `BEGIN IMMEDIATE` 事务内完成"读链锚点 → 复制全部未压缩事件(含 `prev_hash`/`hash`)→ 写元数据(锚点序号与哈希、末尾序号、总数)→ 写副本",与事件接收、压缩归档串行,副本与元数据来自同一时刻。`GET /exports/{id}/events` 只查副本表,按原 `seq` 升序分页,`after_seq` 默认锚点序号且必须落在 `[anchor_seq, tail_seq]`(越界 422),`limit` 限 1~1000,以"多取一条"判定 `next_after_seq`(末页为 `null`);后续写入、原事件压缩、服务重启均不影响结果,空快照 `tail_seq == anchor_seq` 且恒为空页。`DELETE /exports/{id}` 在同一事务内原子删除元数据与副本,未知或已删除快照统一 404。
 - **配置**:数据库路径由环境变量 `DB_PATH` 控制(容器内默认 `/data/events.db`)。
 
 ## API 一览
@@ -372,6 +435,9 @@ curl -s http://localhost:8000/integrity
 | POST | `/consumers/{consumer_id}/quarantine` | 隔离当前未过期租约的首条事件(带非空 `reason`):单事务核对令牌与租约相邻性、复制完整事件到独立隔离记录、游标越过一条并清除整批租约;无租约/过期/旧令牌/不相邻返回 409,原因为空返回 422 |
 | GET | `/consumers/{consumer_id}/quarantine` | 分页查询该 consumer 的隔离记录;携带原事件完整内容副本,原事件归档后仍可查看 |
 | POST | `/retention/compact` | 安全归档压缩连续事件前缀(`cutoff_seq`/`dry_run`);越界 409 并返回 `safe_through_seq` |
+| POST | `/exports` | 单事务复制当前全部未压缩事件及链锚点,返回快照 ID、锚点序号与哈希、末尾序号和总数 |
+| GET | `/exports/{id}/events` | 按原 seq 升序分页读取快照副本(完整事件含 `prev_hash`/`hash`);`after_seq` 默认锚点、限 `[anchor_seq, tail_seq]`(越界 422),`limit` 1~1000,`next_after_seq` 末页为 null;只读副本,后续写入/压缩/重启均不改变结果 |
+| DELETE | `/exports/{id}` | 原子删除快照元数据与副本;未知或已删除快照统一 404 |
 | GET | `/health` | 健康检查 |
 
 交互式文档:启动后访问 `http://localhost:8000/docs`。

@@ -96,6 +96,19 @@ def row_to_event(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def row_to_full_event(row: sqlite3.Row) -> dict[str, Any]:
+    """完整事件视图: 除列表字段外含 prev_hash/hash, 用于快照分页(副本或原表通用)。"""
+    return {
+        "seq": row["seq"] if "seq" in row.keys() else row["id"],
+        "event_id": row["event_id"],
+        "occurred_at": row["occurred_at"],
+        "payload": json.loads(row["payload"]),
+        "received_at": row["received_at"],
+        "prev_hash": row["prev_hash"],
+        "hash": row["hash"],
+    }
+
+
 def row_to_quarantine(row: sqlite3.Row) -> dict[str, Any]:
     """隔离记录视图: 自带原事件完整内容副本, 原记录被压缩归档后仍可查看。"""
     return {
@@ -830,3 +843,134 @@ def integrity():
         "first_break": None,
         "anchor_seq": anchor_seq,
     }
+
+
+# ---------- exports: 持久化快照导出 ----------
+
+@app.post("/exports", status_code=201)
+def create_export():
+    """在同一数据库事务内复制当前全部未压缩事件及链锚点, 生成不可变快照。
+
+    BEGIN IMMEDIATE 与事件接收、压缩归档互斥串行, 保证副本与元数据
+    (锚点、末尾序号、总数)来自同一时刻。快照只读取独立副本, 之后的
+    新写入、原事件压缩乃至服务重启都不影响分页结果。
+    """
+    export_id = secrets.token_hex(16)
+    created_at = utc_now()
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        anchor_seq, anchor_hash = get_chain_anchor(conn)
+        rows = conn.execute(
+            "SELECT id, event_id, occurred_at, payload, received_at, prev_hash, hash"
+            " FROM events WHERE id > ? ORDER BY id",
+            (anchor_seq,),
+        ).fetchall()
+        tail_seq = rows[-1]["id"] if rows else anchor_seq
+        conn.execute(
+            "INSERT INTO exports (export_id, anchor_seq, anchor_hash, tail_seq,"
+            " total, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (export_id, anchor_seq, anchor_hash, tail_seq, len(rows), created_at),
+        )
+        conn.executemany(
+            "INSERT INTO export_events (export_id, seq, event_id, occurred_at,"
+            " payload, received_at, prev_hash, hash)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    export_id,
+                    r["id"],
+                    r["event_id"],
+                    r["occurred_at"],
+                    r["payload"],
+                    r["received_at"],
+                    r["prev_hash"],
+                    r["hash"],
+                )
+                for r in rows
+            ],
+        )
+
+    return {
+        "export_id": export_id,
+        "anchor_seq": anchor_seq,
+        "anchor_hash": anchor_hash,
+        "tail_seq": tail_seq,
+        "total": len(rows),
+        "created_at": created_at,
+    }
+
+
+@app.get("/exports/{export_id}/events")
+def list_export_events(
+    export_id: str = Path(..., min_length=1, max_length=255),
+    after_seq: Optional[int] = Query(
+        None, description="只返回 seq 严格大于该值的事件; 默认快照锚点序号"
+    ),
+    limit: int = Query(100, ge=1, le=1000),
+):
+    """按原 seq 升序分页读取快照副本, 返回完整事件(含 prev_hash/hash)。
+
+    - after_seq 默认取快照锚点序号; 必须落在 [anchor_seq, tail_seq] 内, 否则 422。
+    - 多取一条判断是否还有后续: 有则 next_after_seq 为末页最后一条的 seq,
+      末页为 null。
+    - 只读快照副本表: 后续写入、原事件压缩归档、服务重启均不改变结果。
+    """
+    with get_conn() as conn:
+        meta = conn.execute(
+            "SELECT anchor_seq, tail_seq, total FROM exports WHERE export_id = ?",
+            (export_id,),
+        ).fetchone()
+        if meta is None:
+            return JSONResponse(status_code=404, content={"detail": "export not found"})
+        anchor_seq, tail_seq = meta["anchor_seq"], meta["tail_seq"]
+
+        if after_seq is None:
+            after_seq = anchor_seq
+        if after_seq < anchor_seq or after_seq > tail_seq:
+            # 锚点之前属于已压缩区间(从未属于本快照); tail_seq 之后尚未产生
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "detail": "after_seq out of snapshot range",
+                    "after_seq": after_seq,
+                    "anchor_seq": anchor_seq,
+                    "tail_seq": tail_seq,
+                },
+            )
+
+        rows = conn.execute(
+            "SELECT seq, event_id, occurred_at, payload, received_at, prev_hash, hash"
+            " FROM export_events WHERE export_id = ? AND seq > ? ORDER BY seq"
+            " LIMIT ?",
+            (export_id, after_seq, limit + 1),
+        ).fetchall()
+
+    has_next = len(rows) > limit
+    page_rows = rows[:limit]
+    next_after_seq = page_rows[-1]["seq"] if has_next else None
+    return {
+        "export_id": export_id,
+        "anchor_seq": anchor_seq,
+        "tail_seq": tail_seq,
+        "after_seq": after_seq,
+        "limit": limit,
+        "next_after_seq": next_after_seq,
+        "events": [row_to_full_event(r) for r in page_rows],
+    }
+
+
+@app.delete("/exports/{export_id}")
+def delete_export(export_id: str = Path(..., min_length=1, max_length=255)):
+    """原子删除快照元数据与全部副本事件; 未知或已删除快照统一 404。"""
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        meta = conn.execute(
+            "SELECT total FROM exports WHERE export_id = ?", (export_id,)
+        ).fetchone()
+        if meta is None:
+            return JSONResponse(status_code=404, content={"detail": "export not found"})
+        conn.execute(
+            "DELETE FROM export_events WHERE export_id = ?", (export_id,)
+        )
+        conn.execute("DELETE FROM exports WHERE export_id = ?", (export_id,))
+    return {"deleted": True, "export_id": export_id, "total": meta["total"]}
