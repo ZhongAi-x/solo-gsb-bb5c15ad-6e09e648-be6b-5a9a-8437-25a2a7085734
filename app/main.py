@@ -114,6 +114,19 @@ def row_to_quarantine(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def row_to_export_event(row: sqlite3.Row) -> dict[str, Any]:
+    """快照副本中的事件视图: 含链字段 prev_hash/hash 的完整记录。"""
+    return {
+        "seq": row["seq"],
+        "event_id": row["event_id"],
+        "occurred_at": row["occurred_at"],
+        "payload": json.loads(row["payload"]),
+        "received_at": row["received_at"],
+        "prev_hash": row["prev_hash"],
+        "hash": row["hash"],
+    }
+
+
 # ---------- endpoints ----------
 
 @app.get("/health")
@@ -830,3 +843,122 @@ def integrity():
         "first_break": None,
         "anchor_seq": anchor_seq,
     }
+
+
+# ---------- exports: 持久化快照导出 ----------
+
+@app.post("/exports", status_code=201)
+def create_export():
+    """创建持久化快照: 同一事务内复制当前全部未压缩事件及链锚点。
+
+    BEGIN IMMEDIATE 与事件写入(/events)、压缩归档(/retention/compact)互斥,
+    保证副本与元数据(锚点/末尾序号/总数)来自同一时刻。副本落库后不再变化:
+    后续写入、原事件被压缩归档、服务重启都不影响已建快照的分页结果。
+    事件表为空时为空快照: end_seq == anchor_seq, total = 0。
+    """
+    created_at = utc_now()
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        anchor_seq, anchor_hash = get_chain_anchor(conn)
+        row = conn.execute("SELECT COUNT(*) AS c, MAX(id) AS m FROM events").fetchone()
+        total = row["c"]
+        # 空事件表: 末尾序号等于锚点序号
+        end_seq = row["m"] if row["m"] is not None else anchor_seq
+        cur = conn.execute(
+            "INSERT INTO export_snapshots (anchor_seq, anchor_hash, end_seq, total,"
+            " created_at) VALUES (?, ?, ?, ?, ?)",
+            (anchor_seq, anchor_hash, end_seq, total, created_at),
+        )
+        export_id = cur.lastrowid
+        # 同一事务内整体复制当前全部未压缩事件(含链字段 prev_hash/hash)
+        conn.execute(
+            "INSERT INTO export_events (snapshot_id, seq, event_id, occurred_at,"
+            " payload, received_at, prev_hash, hash)"
+            " SELECT ?, id, event_id, occurred_at, payload, received_at, prev_hash,"
+            " hash FROM events ORDER BY id",
+            (export_id,),
+        )
+    return {
+        "export_id": export_id,
+        "anchor_seq": anchor_seq,
+        "anchor_hash": anchor_hash,
+        "end_seq": end_seq,
+        "total": total,
+        "created_at": created_at,
+    }
+
+
+@app.get("/exports/{export_id}/events")
+def list_export_events(
+    export_id: int = Path(...),
+    after_seq: Optional[int] = Query(
+        None, description="起始序号(不含), 默认为该快照的锚点序号"
+    ),
+    limit: int = Query(100, ge=1, le=1000),
+):
+    """按原 seq 升序分页读取快照副本, 返回完整事件(含 prev_hash/hash)。
+
+    - after_seq 缺省为快照锚点序号, 即从副本第一条开始; 必须落在
+      [anchor_seq, end_seq] 内, 否则 422(响应附锚点与末尾序号)。
+    - next_after_seq 为下一页的起始序号, 末页为 null; 空快照始终返回空页。
+    - 只读副本: 与 events 表无关, 后续写入/压缩/重启均不改变结果。
+    """
+    with get_conn() as conn:
+        snap = conn.execute(
+            "SELECT id, anchor_seq, end_seq FROM export_snapshots WHERE id = ?",
+            (export_id,),
+        ).fetchone()
+        # 未知或已删除的快照统一 404
+        if snap is None:
+            return JSONResponse(status_code=404, content={"detail": "export not found"})
+
+        start = snap["anchor_seq"] if after_seq is None else after_seq
+        if start < snap["anchor_seq"] or start > snap["end_seq"]:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "detail": "after_seq out of snapshot range",
+                    "after_seq": start,
+                    "anchor_seq": snap["anchor_seq"],
+                    "end_seq": snap["end_seq"],
+                },
+            )
+
+        # 多取一条判断是否还有下一页
+        rows = conn.execute(
+            "SELECT seq, event_id, occurred_at, payload, received_at, prev_hash, hash"
+            " FROM export_events WHERE snapshot_id = ? AND seq > ?"
+            " ORDER BY seq LIMIT ?",
+            (export_id, start, limit + 1),
+        ).fetchall()
+
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    return {
+        "export_id": export_id,
+        "after_seq": start,
+        "limit": limit,
+        "count": len(rows),
+        "events": [row_to_export_event(r) for r in rows],
+        # 末页(含空页)为 null
+        "next_after_seq": rows[-1]["seq"] if has_more else None,
+    }
+
+
+@app.delete("/exports/{export_id}")
+def delete_export(export_id: int = Path(...)):
+    """删除快照: 同一事务内原子删除元数据与全部事件副本。
+
+    未知或已删除的快照统一返回 404, 状态不变。
+    """
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        snap = conn.execute(
+            "SELECT id FROM export_snapshots WHERE id = ?", (export_id,)
+        ).fetchone()
+        # 未知或已删除统一 404
+        if snap is None:
+            return JSONResponse(status_code=404, content={"detail": "export not found"})
+        conn.execute("DELETE FROM export_events WHERE snapshot_id = ?", (export_id,))
+        conn.execute("DELETE FROM export_snapshots WHERE id = ?", (export_id,))
+    return {"export_id": export_id, "deleted": True}
